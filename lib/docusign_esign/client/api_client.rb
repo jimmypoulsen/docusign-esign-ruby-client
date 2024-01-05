@@ -52,33 +52,38 @@ module DocuSign_eSign
     #   the data deserialized from response body (could be nil), response status code and response headers.
     def call_api(http_method, path, opts = {})
       request = build_request(http_method, path, opts)
-      response = request.run
+      http = Net::HTTP.new(request.uri.host, request.uri.port)
+      http.use_ssl = request.uri.scheme == 'https'
+
+      if @config.verify_ssl
+        http.verify_mode = OpenSSL::SSL::VERIFY_PEER
+      else
+        http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+      end
+
+      binding.irb
+
+      begin
+        response = http.start { |http| http.request(request) }
+      rescue Timeout::Error
+        raise ApiError.new('Connection timed out')
+      rescue StandardError => e
+        raise ApiError.new(:message => e.message)
+      end
 
       if @config.debugging
         @config.logger.debug "HTTP response body ~BEGIN~\n#{response.body}\n~END~\n"
       end
 
-      unless response.success?
-        if response.timed_out?
-          fail ApiError.new('Connection timed out')
-        elsif response.code == 0
-          # Errors from libcurl will be made visible here
-          fail ApiError.new(:code => 0,
-                            :message => response.return_message)
-        else
-          fail ApiError.new(:code => response.code,
-                            :response_headers => response.headers,
-                            :response_body => response.body),
-               response.status_message
-        end
+      unless response.is_a?(Net::HTTPSuccess)
+        fail ApiError.new(:code => response.code,
+          :response_headers => response.to_hash,
+          :response_body => response.body),
+          response.message
       end
 
-      if opts[:return_type]
-        data = deserialize(response, opts[:return_type])
-      else
-        data = nil
-      end
-      return data, response.code, response.headers
+      data = opts[:return_type] ? deserialize(response, opts[:return_type]) : nil
+      return data, response.code.to_i, response.to_hash
     end
 
     # Builds the HTTP request
@@ -92,46 +97,26 @@ module DocuSign_eSign
     # @return [Typhoeus::Request] A Typhoeus Request
     def build_request(http_method, path, opts = {})
       url = build_request_url(path, opts)
-      http_method = http_method.to_sym.downcase
+      uri = URI.parse(url)
+
+      http_method = http_method.capitalize
+      request = Net::HTTP.const_get(http_method).new(uri)
 
       header_params = @default_headers.merge(opts[:header_params] || {})
-
-      # Add SDK default header
-      header_params.store("X-DocuSign-SDK", "Ruby")
+      header_params.each { |key, value| request[key] = value }
 
       query_params = opts[:query_params] || {}
-      form_params = opts[:form_params] || {}
+      uri.query = URI.encode_www_form(query_params)
 
-      update_params_for_auth! header_params, query_params, opts[:auth_names]
-
-      # set ssl_verifyhosts option based on @config.verify_ssl_host (true/false)
-      _verify_ssl_host = @config.verify_ssl_host ? 2 : 0
-      
-      req_opts = {
-        :method => http_method,
-        :headers => header_params,
-        :params => query_params,
-        :params_encoding => @config.params_encoding,
-        :timeout => @config.timeout,
-        :ssl_verifypeer => @config.verify_ssl,
-        :ssl_verifyhost => _verify_ssl_host,
-        :sslcert => @config.cert_file,
-        :sslkey => @config.key_file,
-        :verbose => @config.debugging
-      }
-
-      # set custom cert, if provided
-      req_opts[:cainfo] = @config.ssl_ca_cert if @config.ssl_ca_cert
-
-      if [:post, :patch, :put, :delete].include?(http_method)
-        req_body = build_request_body(header_params, form_params, opts[:body])
-        req_opts.update :body => req_body
+      if %w[Post Patch Put Delete].include?(http_method)
+        req_body = build_request_body(header_params, opts[:form_params], opts[:body])
+        request.body = req_body
         if @config.debugging
           @config.logger.debug "HTTP request body param ~BEGIN~\n#{req_body}\n~END~\n"
         end
       end
 
-      Typhoeus::Request.new(url, req_opts)
+      request
     end
 
     # Check if the given MIME is a JSON MIME.
@@ -161,7 +146,7 @@ module DocuSign_eSign
       return download_file(response) if return_type == 'File'
 
       # ensuring a default content type
-      content_type = response.headers['Content-Type'] || 'application/json'
+      content_type = response['Content-Type'] || 'application/json'
 
       fail "Content-Type is not supported: #{content_type}" unless json_mime?(content_type)
 
@@ -226,7 +211,7 @@ module DocuSign_eSign
     # @see Configuration#temp_folder_path
     # @return [Tempfile] the file downloaded
     def download_file(response)
-      content_disposition = response.headers['Content-Disposition']
+      content_disposition = response['Content-Disposition']
       if content_disposition and content_disposition =~ /filename=/i
         filename = content_disposition[/filename=['"]?([^'"\s]+)['"]?/, 1]
         prefix = sanitize_filename(filename)
@@ -271,30 +256,30 @@ module DocuSign_eSign
     # @param [Object] body HTTP body (JSON/XML)
     # @return [String] HTTP body data in the form of string
     def build_request_body(header_params, form_params, body)
-      # http form
-      if header_params['Content-Type'] == 'application/x-www-form-urlencoded' ||
-          header_params['Content-Type'] == 'multipart/form-data'
-        data = {}
+      if header_params['Content-Type'] == 'application/x-www-form-urlencoded'
+        # Encode form parameters
+        URI.encode_www_form(form_params)
+      elsif header_params['Content-Type'] == 'application/json'
+        # Convert body to JSON string
+        body.is_a?(String) ? body : body.to_json
+      elsif header_params['Content-Type'] == 'multipart/form-data'
+        # Multipart form data handling (simplified version)
+        boundary = "----RubyMultipartClient#{rand(1000000)}"
+        header_params['Content-Type'] = "multipart/form-data; boundary=#{boundary}"
+
+        multipart_body = ""
         form_params.each do |key, value|
-          case value
-          when File, Array, nil
-            # let typhoeus handle File, Array and nil parameters
-            data[key] = value
-          else
-            if header_params['Content-Type'] == 'multipart/form-data'
-              header_params['Content-Disposition'] = 'form-data; name=file; filename=' + key
-              data = value
-            else
-              data[key] = value.to_s
-            end
-          end
+          multipart_body << "--#{boundary}\r\n"
+          multipart_body << "Content-Disposition: form-data; name=\"#{key}\"\r\n\r\n"
+          multipart_body << "#{value}\r\n"
         end
-      elsif body
-        data = body.is_a?(String) ? body : body.to_json
+        multipart_body << "--#{boundary}--\r\n"
+
+        multipart_body
       else
-        data = nil
+        # Default to converting to string
+        body.to_s
       end
-      data
     end
 
     # Update hearder and query params based on authentication settings.
