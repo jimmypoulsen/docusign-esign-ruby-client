@@ -61,8 +61,6 @@ module DocuSign_eSign
         http.verify_mode = OpenSSL::SSL::VERIFY_NONE
       end
 
-      binding.irb
-
       begin
         response = http.start { |http| http.request(request) }
       rescue Timeout::Error
@@ -108,7 +106,7 @@ module DocuSign_eSign
       query_params = opts[:query_params] || {}
       uri.query = URI.encode_www_form(query_params)
 
-      if %w[Post Patch Put Delete].include?(http_method)
+      if %w[Post Patch Put Delete].include?(http_method.to_s)
         req_body = build_request_body(header_params, opts[:form_params], opts[:body])
         request.body = req_body
         if @config.debugging
